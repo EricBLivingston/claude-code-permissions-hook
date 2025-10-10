@@ -44,7 +44,6 @@ fn try_log_tool_use(log_path: &Path, input: &HookInput) -> anyhow::Result<()> {
     let mut flock = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, e)| e)?;
 
     writeln!(flock, "{}", json_line)?;
-    writeln!(flock, "---")?;
 
     flock.unlock().map_err(|(_, e)| e)?;
 

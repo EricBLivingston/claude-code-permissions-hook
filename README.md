@@ -234,11 +234,10 @@ Set `log_level` in the TOML config file (trace, debug, info, warn, error). Defau
 
 ## Log Format
 
-Logs are written in JSON format with a separator:
+Logs are written in JSON format, one entry per line:
 
 ```json
 {"timestamp":"2025-10-06T10:27:59Z","session_id":"abc123","tool_name":"Read","tool_input":{...},"cwd":"/path"}
----
 ```
 
 ## License
