@@ -1,0 +1,37 @@
+[logging]
+log_file = "/tmp/claude-tool-use.log"
+# Log level: trace, debug, info, warn, error (default: info)
+# - trace: logs every rule evaluation and match attempt
+# - debug: logs rule matches and exclude skips
+# - info: logs allow/deny decisions only
+# - warn/error: minimal logging
+# Note: Can be overridden by RUST_LOG environment variable for testing
+log_level = "debug"
+
+# Allow rules - checked after deny rules
+[[allow]]
+tool = "Read"
+file_path_regex = "^/Users/korny/prj/.*"
+file_path_exclude_regex = "\\.\\."
+
+[[allow]]
+tool = "Bash"
+command_regex = "^cargo (build|test|check|clippy|fmt|run)"
+command_exclude_regex = "&|;|\\||`|\\$\\("
+
+[[allow]]
+tool = "Task"
+subagent_type = "codebase-analyzer"
+
+# Deny rules - checked first (take precedence)
+[[deny]]
+tool = "Bash"
+command_regex = "^rm .*-rf"
+
+[[deny]]
+tool = "Read"
+file_path_regex = "\\.(env|secret)$"
+
+[[deny]]
+tool = "Read"
+file_path_regex = ".*\\.\\./.*"
