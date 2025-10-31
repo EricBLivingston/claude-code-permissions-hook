@@ -55,7 +55,7 @@ pub struct LlmFallbackConfig {
     #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
     #[serde(default)]
-    pub actions: ActionPolicy,
+    pub provider_preferences: Option<Vec<String>>,
 }
 
 impl Default for LlmFallbackConfig {
@@ -69,7 +69,7 @@ impl Default for LlmFallbackConfig {
             temperature: default_temperature(),
             max_retries: default_max_retries(),
             system_prompt: default_system_prompt(),
-            actions: ActionPolicy::default(),
+            provider_preferences: None,
         }
     }
 }
@@ -138,59 +138,6 @@ CLASSIFICATION RULES (apply in this order):
    - Info: ls, cat, echo, ps, netstat (not redirecting to system paths)"#.to_string()
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct ActionPolicy {
-    #[serde(default = "default_on_safe")]
-    pub on_safe: Action,
-    #[serde(default = "default_on_unsafe")]
-    pub on_unsafe: Action,
-    #[serde(default = "default_on_unknown")]
-    pub on_unknown: Action,
-    #[serde(default = "default_on_timeout")]
-    pub on_timeout: Action,
-    #[serde(default = "default_on_error")]
-    pub on_error: Action,
-}
-
-impl Default for ActionPolicy {
-    fn default() -> Self {
-        Self {
-            on_safe: default_on_safe(),
-            on_unsafe: default_on_unsafe(),
-            on_unknown: default_on_unknown(),
-            on_timeout: default_on_timeout(),
-            on_error: default_on_error(),
-        }
-    }
-}
-
-fn default_on_safe() -> Action {
-    Action::Allow
-}
-
-fn default_on_unsafe() -> Action {
-    Action::Deny
-}
-
-fn default_on_unknown() -> Action {
-    Action::PassThrough
-}
-
-fn default_on_timeout() -> Action {
-    Action::PassThrough
-}
-
-fn default_on_error() -> Action {
-    Action::PassThrough
-}
-
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Action {
-    Allow,
-    Deny,
-    PassThrough,
-}
 
 #[derive(Debug, Deserialize)]
 pub struct RuleConfig {

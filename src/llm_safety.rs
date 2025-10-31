@@ -1,18 +1,10 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::all)]
 
-use crate::config::{Action, ActionPolicy, LlmFallbackConfig};
+use crate::config::LlmFallbackConfig;
 use crate::hook_io::{HookInput, HookOutput};
 use crate::logging::log_llm_decision;
 use anyhow::{Context, Result};
-use async_openai::{
-    config::OpenAIConfig,
-    types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
-    },
-    Client,
-};
 use log::{debug, error, info, warn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -21,9 +13,8 @@ use tokio::time::timeout;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SafetyAssessment {
-    Safe(String),    // reasoning
-    Unsafe(String),  // reasoning
-    Unknown(String), // reasoning
+    Allow(String),  // reasoning - operation is clearly safe, auto-approve
+    Query(String),  // reasoning - needs user review (unsafe, ambiguous, or uncertain)
 }
 
 #[derive(Debug)]
@@ -68,75 +59,64 @@ pub async fn assess_with_llm(config: &LlmFallbackConfig, input: &HookInput) -> A
     }
 }
 
-/// Apply LLM result based on configured action policy
+/// Apply LLM result with fixed binary actions
 pub fn apply_llm_result(
     log_path: &std::path::Path,
     input: &HookInput,
-    policy: &ActionPolicy,
     result: AssessmentResult,
+    test_mode: bool,
 ) -> Option<HookOutput> {
     use AssessmentResult::*;
     use SafetyAssessment::*;
 
-    let (action, reasoning, assessment_type) = match result {
-        Assessment(Safe(r)) => (
-            policy.on_safe,
-            format!("LLM-SAFE: {}", r),
-            "SAFE",
-        ),
-        Assessment(Unsafe(r)) => (
-            policy.on_unsafe,
-            format!("LLM-UNSAFE: {}", r),
-            "UNSAFE",
-        ),
-        Assessment(Unknown(r)) => (
-            policy.on_unknown,
-            format!("LLM-UNKNOWN: {}", r),
-            "UNKNOWN",
-        ),
-        Timeout => (
-            policy.on_timeout,
-            "LLM request timed out".to_string(),
-            "TIMEOUT",
-        ),
-        Error(e) => (policy.on_error, format!("LLM error: {}", e), "ERROR"),
+    let output = match result {
+        Assessment(Allow(r)) => {
+            let reasoning = format!("LLM-ALLOW: {}", r);
+            info!("Auto-approving: {}", reasoning);
+            let hook_output = HookOutput::allow(reasoning);
+            log_llm_decision(log_path, input, "ALLOW", &hook_output);
+            Some(hook_output)
+        }
+        Assessment(Query(r)) => {
+            let reasoning = format!("LLM-QUERY: {}", r);
+            info!("Sending to user: {}", reasoning);
+            let hook_output = HookOutput::deny(reasoning);
+            log_llm_decision(log_path, input, "QUERY", &hook_output);
+            // In test mode, output the decision; otherwise pass through
+            if test_mode {
+                Some(hook_output)
+            } else {
+                None
+            }
+        }
+        Timeout => {
+            warn!("LLM timeout - passing to user for review");
+            let hook_output = HookOutput::deny("LLM timeout".to_string());
+            log_llm_decision(log_path, input, "TIMEOUT", &hook_output);
+            // In test mode, output the decision; otherwise pass through
+            if test_mode {
+                Some(hook_output)
+            } else {
+                None
+            }
+        }
+        Error(e) => {
+            error!("LLM error: {} - passing to user for review", e);
+            let hook_output = HookOutput::deny(format!("LLM error: {}", e));
+            log_llm_decision(log_path, input, "ERROR", &hook_output);
+            // In test mode, output the decision; otherwise pass through
+            if test_mode {
+                Some(hook_output)
+            } else {
+                None
+            }
+        }
     };
-
-    let output = match action {
-        Action::Allow => {
-            debug!("LLM result: ALLOW - {}", reasoning);
-            Some(HookOutput::allow(reasoning))
-        }
-        Action::Deny => {
-            debug!("LLM result: DENY - {}", reasoning);
-            Some(HookOutput::deny(reasoning))
-        }
-        Action::PassThrough => {
-            debug!("LLM result: PASS_THROUGH - {}", reasoning);
-            None
-        }
-    };
-
-    // Log the decision if we're making one
-    if let Some(ref hook_output) = output {
-        log_llm_decision(log_path, input, assessment_type, hook_output);
-    }
 
     output
 }
 
 async fn call_llm(config: &LlmFallbackConfig, input: &HookInput) -> Result<SafetyAssessment> {
-    // Configure OpenAI-compatible client
-    let mut openai_config = OpenAIConfig::new().with_api_base(&config.endpoint);
-
-    // Set API key if provided (not needed for local Ollama)
-    if let Some(api_key) = &config.api_key
-        && !api_key.is_empty()
-    {
-        openai_config = openai_config.with_api_key(api_key);
-    }
-
-    let client = Client::with_config(openai_config);
     let prompt = build_safety_prompt(input);
     
     // Retry loop for malformed JSON responses
@@ -147,35 +127,92 @@ async fn call_llm(config: &LlmFallbackConfig, input: &HookInput) -> Result<Safet
         
         debug!("LLM prompt (attempt {}):\n{}", attempt + 1, prompt);
 
-        let request = CreateChatCompletionRequestArgs::default()
-            .model(&config.model)
-            .temperature(config.temperature)
-            .messages(vec![
-                ChatCompletionRequestMessage::System(
-                    ChatCompletionRequestSystemMessageArgs::default()
-                        .content(config.system_prompt.clone())
-                        .build()?,
-                ),
-                ChatCompletionRequestMessage::User(
-                    ChatCompletionRequestUserMessageArgs::default()
-                        .content(prompt.clone())
-                        .build()?,
-                ),
-            ])
-            .build()?;
-
-        let response = client
-            .chat()
-            .create(request)
-            .await
-            .context("Failed to call LLM API")?;
-
-        let content = response
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.as_ref())
+        // Build request JSON
+        // Note: keep_alive doesn't work with OpenAI-compatible endpoint
+        // Set OLLAMA_KEEP_ALIVE=1h environment variable for Ollama instead
+        let mut request_json = serde_json::json!({
+            "model": config.model,
+            "temperature": config.temperature,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": config.system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        });
+        
+        // Add provider preferences if specified (OpenRouter-specific)
+        if let Some(ref providers) = config.provider_preferences {
+            if !providers.is_empty() {
+                if let Some(obj) = request_json.as_object_mut() {
+                    obj.insert(
+                        "provider".to_string(),
+                        serde_json::json!({"order": providers})
+                    );
+                }
+            }
+        }
+        
+        let request_payload = serde_json::to_string_pretty(&request_json).unwrap_or_default();
+        info!("=== REQUEST PAYLOAD ===\n{}", request_payload);
+        info!("=== END PAYLOAD ===");
+        
+        // Make HTTP request
+        info!("Sending request to: {}/chat/completions", config.endpoint);
+        info!("API key present: {}", config.api_key.as_ref().map_or("NO", |k| if k.is_empty() { "EMPTY" } else { "YES" }));
+        info!("Timeout: {} seconds", config.timeout_secs);
+        
+        let response = reqwest::Client::new()
+                    .post(format!("{}/chat/completions", config.endpoint))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", config.api_key.as_deref().unwrap_or("")))
+                    .json(&request_json)
+                    .timeout(std::time::Duration::from_secs(config.timeout_secs))
+                    .send()
+            .await;
+        
+        let response = match response {
+            Ok(resp) => {
+                info!("HTTP status: {}", resp.status());
+                resp
+            }
+            Err(e) => {
+                if e.is_timeout() {
+                    error!("Request TIMEOUT after {} seconds", config.timeout_secs);
+                } else if e.is_connect() {
+                    error!("Connection failed: {}", e);
+                } else {
+                    error!("Request failed: {}", e);
+                }
+                error!("Full error details: {:?}", e);
+                return Err(anyhow::anyhow!("Failed to send LLM request: {}", e));
+            }
+        };
+        
+        let response_text = match response.text().await {
+            Ok(text) => {
+                debug!("Response length: {} chars", text.len());
+                text
+            }
+            Err(e) => {
+                error!("Failed to read response text: {}", e);
+                return Err(anyhow::anyhow!("Failed to read LLM response: {}", e));
+            }
+        };
+        
+        debug!("LLM raw API response: {}", response_text);
+        
+        let api_response: serde_json::Value = serde_json::from_str(&response_text)
+            .context("Failed to parse LLM API response as JSON")?;
+        
+        let content = api_response["choices"][0]["message"]["content"]
+            .as_str()
             .context("No response content from LLM")?;
-
+        
         debug!("LLM raw response (attempt {}): {}", attempt + 1, content);
 
         match parse_llm_response(content) {
@@ -206,18 +243,21 @@ fn build_safety_prompt(input: &HookInput) -> String {
     let params =
         serde_json::to_string_pretty(&input.tool_input).unwrap_or_else(|_| "{}".to_string());
 
-    format!(r#"Classify the following tool request as SAFE, UNSAFE, or UNKNOWN based on the above rules.
+    format!(r#"Classify this operation as ALLOW or QUERY.
+
+ALLOW = Clearly safe development operation, auto-approve
+QUERY = Anything else (unsafe, ambiguous, unfamiliar) - user will review
 
 Tool: {}
 Parameters:
 {}
 
-CRITICAL: When uncertain between SAFE and UNKNOWN, choose UNKNOWN.
-CRITICAL: When uncertain between UNSAFE and UNKNOWN, choose UNKNOWN.
+CRITICAL: Only use ALLOW if you are 100% confident the operation is safe.
+CRITICAL: When in doubt, always use QUERY.
 
 Respond in this exact JSON format:
 {{
-  "classification": "SAFE|UNSAFE|UNKNOWN",
+  "classification": "ALLOW|QUERY",
   "reasoning": "brief explanation"
 }}
 
@@ -252,10 +292,12 @@ fn parse_llm_response(content: &str) -> Result<SafetyAssessment> {
 
     // Validate and classify
     match response.classification.to_uppercase().as_str() {
-        "SAFE" => Ok(SafetyAssessment::Safe(response.reasoning)),
-        "UNSAFE" => Ok(SafetyAssessment::Unsafe(response.reasoning)),
-        "UNKNOWN" => Ok(SafetyAssessment::Unknown(response.reasoning)),
-        other => anyhow::bail!("Invalid classification '{}' - must be SAFE, UNSAFE, or UNKNOWN", other),
+        "ALLOW" => Ok(SafetyAssessment::Allow(response.reasoning)),
+        "QUERY" => Ok(SafetyAssessment::Query(response.reasoning)),
+        // Handle legacy responses during transition
+        "SAFE" => Ok(SafetyAssessment::Allow(response.reasoning)),
+        "UNSAFE" | "UNKNOWN" => Ok(SafetyAssessment::Query(response.reasoning)),
+        other => anyhow::bail!("Invalid classification '{}' - must be ALLOW or QUERY", other),
     }
 }
 

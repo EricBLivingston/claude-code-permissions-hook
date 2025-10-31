@@ -47,34 +47,30 @@ struct TestCase {
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 enum Classification {
-    Safe,
-    Unsafe,
-    Unknown,
+    Allow,  // Auto-approve (was SAFE)
+    Query,  // Send to user (was UNSAFE or UNKNOWN)
 }
 
 impl Classification {
     fn from_str(s: &str) -> Result<Self> {
         match s.to_uppercase().as_str() {
-            "SAFE" => Ok(Classification::Safe),
-            "UNSAFE" => Ok(Classification::Unsafe),
-            "UNKNOWN" => Ok(Classification::Unknown),
+            "ALLOW" => Ok(Classification::Allow),
+            "QUERY" => Ok(Classification::Query),
             other => anyhow::bail!("Invalid classification: {}", other),
         }
     }
 
     fn as_str(&self) -> &str {
         match self {
-            Classification::Safe => "SAFE",
-            Classification::Unsafe => "UNSAFE",
-            Classification::Unknown => "UNKNOWN",
+            Classification::Allow => "ALLOW",
+            Classification::Query => "QUERY",
         }
     }
 
     fn from_decision(decision: &str) -> Self {
         match decision {
-            "allow" => Classification::Safe,
-            "deny" => Classification::Unsafe,
-            _ => Classification::Unknown,
+            "allow" => Classification::Allow,
+            _ => Classification::Query,  // deny or no output = query
         }
     }
 }
@@ -86,7 +82,6 @@ struct TestResult {
     tool_input_key: String,
     tool_input_value: String,
     expected_class: String,
-    llm_decision: String,
     llm_class: String,
     llm_reasoning: String,
     correct: bool,
@@ -247,6 +242,7 @@ fn run_single_test(test_case: &TestCase, config_path: &PathBuf) -> TestResult {
     let output = Command::new("cargo")
         .args(["run", "--quiet", "--release", "--bin", "claude-code-permissions-hook", "--", "run", "--config"])
         .arg(config_path)
+        .arg("--test-mode")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -259,25 +255,24 @@ fn run_single_test(test_case: &TestCase, config_path: &PathBuf) -> TestResult {
         });
 
     let expected_class = Classification::from_str(&test_case.expected_class)
-        .unwrap_or(Classification::Unknown);
+        .unwrap_or(Classification::Query);
 
     match output {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             
             if stdout.trim().is_empty() {
-                // No output = pass through = Unknown
+                // Empty output shouldn't happen in test mode
                 TestResult {
                     id: test_case.id.clone(),
                     tool_name: test_case.tool_name.clone(),
                     tool_input_key: test_case.tool_input_key.clone(),
                     tool_input_value: test_case.tool_input_value.clone(),
                     expected_class: expected_class.as_str().to_string(),
-                    llm_decision: "pass_through".to_string(),
-                    llm_class: Classification::Unknown.as_str().to_string(),
-                    llm_reasoning: "No output (pass through)".to_string(),
-                    correct: expected_class == Classification::Unknown,
-                    error: None,
+                    llm_class: "ERROR".to_string(),
+                    llm_reasoning: "".to_string(),
+                    correct: false,
+                    error: Some("No output in test mode (unexpected)".to_string()),
                 }
             } else {
                 // Parse JSON output
@@ -298,7 +293,6 @@ fn run_single_test(test_case: &TestCase, config_path: &PathBuf) -> TestResult {
                             tool_input_key: test_case.tool_input_key.clone(),
                             tool_input_value: test_case.tool_input_value.clone(),
                             expected_class: expected_class.as_str().to_string(),
-                            llm_decision: decision.to_string(),
                             llm_class: llm_class.as_str().to_string(),
                             llm_reasoning: reasoning.to_string(),
                             correct: expected_class == llm_class,
@@ -311,7 +305,6 @@ fn run_single_test(test_case: &TestCase, config_path: &PathBuf) -> TestResult {
                         tool_input_key: test_case.tool_input_key.clone(),
                         tool_input_value: test_case.tool_input_value.clone(),
                         expected_class: expected_class.as_str().to_string(),
-                        llm_decision: "error".to_string(),
                         llm_class: "ERROR".to_string(),
                         llm_reasoning: "".to_string(),
                         correct: false,
@@ -328,7 +321,6 @@ fn run_single_test(test_case: &TestCase, config_path: &PathBuf) -> TestResult {
                 tool_input_key: test_case.tool_input_key.clone(),
                 tool_input_value: test_case.tool_input_value.clone(),
                 expected_class: expected_class.as_str().to_string(),
-                llm_decision: "error".to_string(),
                 llm_class: "ERROR".to_string(),
                 llm_reasoning: "".to_string(),
                 correct: false,
@@ -341,7 +333,6 @@ fn run_single_test(test_case: &TestCase, config_path: &PathBuf) -> TestResult {
             tool_input_key: test_case.tool_input_key.clone(),
             tool_input_value: test_case.tool_input_value.clone(),
             expected_class: expected_class.as_str().to_string(),
-            llm_decision: "error".to_string(),
             llm_class: "ERROR".to_string(),
             llm_reasoning: "".to_string(),
             correct: false,
@@ -358,9 +349,8 @@ fn calculate_metrics(
     let accuracy = correct as f64 / total as f64;
 
     let mut per_class: HashMap<Classification, ClassMetrics> = HashMap::new();
-    per_class.insert(Classification::Safe, ClassMetrics::default());
-    per_class.insert(Classification::Unsafe, ClassMetrics::default());
-    per_class.insert(Classification::Unknown, ClassMetrics::default());
+    per_class.insert(Classification::Allow, ClassMetrics::default());
+    per_class.insert(Classification::Query, ClassMetrics::default());
 
     for result in results {
         if result.error.is_some() {
@@ -409,7 +399,7 @@ fn write_markdown_report(
     writeln!(f, "| Class   | Precision | Recall | F1 Score | Support |")?;
     writeln!(f, "|---------|-----------|--------|----------|---------|")?;
 
-    for class in &[Classification::Safe, Classification::Unsafe, Classification::Unknown] {
+    for class in &[Classification::Allow, Classification::Query] {
         let metrics = &per_class_metrics[class];
         let support = results.iter()
             .filter(|r| Classification::from_str(&r.expected_class).unwrap() == *class)
@@ -504,7 +494,7 @@ fn print_summary(
     println!();
     println!("Per-Class Metrics:");
 
-    for class in &[Classification::Safe, Classification::Unsafe, Classification::Unknown] {
+    for class in &[Classification::Allow, Classification::Query] {
         let metrics = &per_class_metrics[class];
         println!(
             "  {:7} - P: {:.2}  R: {:.2}  F1: {:.2}",

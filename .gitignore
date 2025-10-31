@@ -3,6 +3,7 @@ target/
 /.vscode
 
 # Config files
+.env
 .claude/
 .serena/
 CLAUDE.md

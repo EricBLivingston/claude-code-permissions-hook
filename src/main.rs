@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::hook_io::{HookInput, HookOutput};
-use crate::logging::log_tool_use;
+use crate::logging::{log_tool_use, log_rule_decision};
 use crate::matcher::{Decision, check_rules};
 
 #[derive(Debug, Parser)]
@@ -34,6 +34,9 @@ enum Commands {
     Run {
         #[clap(short, long, value_parser)]
         config: PathBuf,
+        /// Test mode: always output decisions (including Query/Timeout/Error) for testing
+        #[clap(long)]
+        test_mode: bool,
     },
     /// Validate a configuration file
     Validate {
@@ -42,7 +45,7 @@ enum Commands {
     },
 }
 
-async fn run_hook(config_path: PathBuf) -> Result<()> {
+async fn run_hook(config_path: PathBuf, test_mode: bool) -> Result<()> {
     let config = Config::load_from_file(&config_path).context("Failed to load configuration")?;
 
     let (deny_rules, allow_rules) = config.compile_rules().context("Failed to compile rules")?;
@@ -58,6 +61,7 @@ async fn run_hook(config_path: PathBuf) -> Result<()> {
             Decision::Deny(r) | Decision::Allow(r) => r,
         };
         let output = HookOutput::deny(reason);
+        log_rule_decision(&config.logging.log_file, &input, "deny", &output);
         output.write_to_stdout()?;
         return Ok(());
     }
@@ -67,11 +71,13 @@ async fn run_hook(config_path: PathBuf) -> Result<()> {
         match decision {
             Decision::Allow(reason) => {
                 let output = HookOutput::allow(reason);
+                log_rule_decision(&config.logging.log_file, &input, "allow", &output);
                 output.write_to_stdout()?;
                 return Ok(());
             }
             Decision::Deny(reason) => {
                 let output = HookOutput::deny(reason);
+                log_rule_decision(&config.logging.log_file, &input, "allow", &output);
                 output.write_to_stdout()?;
                 return Ok(());
             }
@@ -85,8 +91,8 @@ async fn run_hook(config_path: PathBuf) -> Result<()> {
         if let Some(output) = llm_safety::apply_llm_result(
             &config.logging.log_file,
             &input,
-            &config.llm_fallback.actions,
             result,
+            test_mode,
         ) {
             output.write_to_stdout()?;
             return Ok(());
@@ -117,7 +123,7 @@ async fn main() -> Result<()> {
 
     // Load config to get log level
     let config_path = match &opts.command {
-        Commands::Run { config } | Commands::Validate { config } => config,
+        Commands::Run { config, .. } | Commands::Validate { config } => config,
     };
 
     let config = Config::load_from_file(config_path).context("Failed to load configuration")?;
@@ -127,7 +133,7 @@ async fn main() -> Result<()> {
         .init();
 
     match opts.command {
-        Commands::Run { config } => run_hook(config).await,
+        Commands::Run { config, test_mode } => run_hook(config, test_mode).await,
         Commands::Validate { config } => validate_config(config),
     }
 }
