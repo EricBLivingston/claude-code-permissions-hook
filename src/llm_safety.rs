@@ -117,21 +117,27 @@ pub fn apply_llm_result(
 }
 
 async fn call_llm(config: &LlmFallbackConfig, input: &HookInput) -> Result<SafetyAssessment> {
+    // Validate configuration (should have been caught by validate command, but double-check)
+    let endpoint = config.endpoint.as_ref()
+        .context("LLM endpoint not configured - this should have been caught during validation")?;
+    let model = config.model.as_ref()
+        .context("LLM model not configured - this should have been caught during validation")?;
+
     let prompt = build_safety_prompt(input);
-    
+
     // Retry loop for malformed JSON responses
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
             info!("LLM retry attempt {}/{}", attempt, config.max_retries);
         }
-        
+
         debug!("LLM prompt (attempt {}):\n{}", attempt + 1, prompt);
 
         // Build request JSON
         // Note: keep_alive doesn't work with OpenAI-compatible endpoint
         // Set OLLAMA_KEEP_ALIVE=1h environment variable for Ollama instead
         let mut request_json = serde_json::json!({
-            "model": config.model,
+            "model": model,
             "temperature": config.temperature,
             "messages": [
                 {
@@ -160,14 +166,14 @@ async fn call_llm(config: &LlmFallbackConfig, input: &HookInput) -> Result<Safet
         let request_payload = serde_json::to_string_pretty(&request_json).unwrap_or_default();
         info!("=== REQUEST PAYLOAD ===\n{}", request_payload);
         info!("=== END PAYLOAD ===");
-        
+
         // Make HTTP request
-        info!("Sending request to: {}/chat/completions", config.endpoint);
+        info!("Sending request to: {}/chat/completions", endpoint);
         info!("API key present: {}", config.api_key.as_ref().map_or("NO", |k| if k.is_empty() { "EMPTY" } else { "YES" }));
         info!("Timeout: {} seconds", config.timeout_secs);
-        
+
         let response = reqwest::Client::new()
-                    .post(format!("{}/chat/completions", config.endpoint))
+                    .post(format!("{}/chat/completions", endpoint))
                     .header("Content-Type", "application/json")
                     .header("Authorization", format!("Bearer {}", config.api_key.as_deref().unwrap_or("")))
                     .json(&request_json)

@@ -40,10 +40,10 @@ fn default_log_level() -> String {
 pub struct LlmFallbackConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_endpoint")]
-    pub endpoint: String,
-    #[serde(default = "default_model")]
-    pub model: String,
+    // REQUIRED when enabled=true - no default to avoid silent misconfigurations
+    pub endpoint: Option<String>,
+    // REQUIRED when enabled=true - no default to avoid silent misconfigurations
+    pub model: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default = "default_timeout_secs")]
@@ -58,12 +58,50 @@ pub struct LlmFallbackConfig {
     pub provider_preferences: Option<Vec<String>>,
 }
 
+impl LlmFallbackConfig {
+    /// Validate LLM fallback configuration
+    /// Returns detailed error messages if enabled but misconfigured
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        // When enabled, endpoint and model are REQUIRED
+        if self.endpoint.is_none() {
+            anyhow::bail!(
+                "LLM fallback is enabled but 'endpoint' is not specified.\n\
+                 Please add: endpoint = \"https://openrouter.ai/api/v1\" (for cloud)\n\
+                 or: endpoint = \"http://localhost:11434/v1\" (for Ollama)"
+            );
+        }
+
+        if self.model.is_none() {
+            anyhow::bail!(
+                "LLM fallback is enabled but 'model' is not specified.\n\
+                 Please add: model = \"anthropic/claude-haiku-4.5\" (for OpenRouter)\n\
+                 or: model = \"dolphin-llama3:8b-v2.9-q8_0\" (for Ollama)"
+            );
+        }
+
+        // Validate endpoint format
+        let endpoint = self.endpoint.as_ref().unwrap();
+        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+            anyhow::bail!(
+                "Invalid LLM endpoint '{}' - must start with http:// or https://",
+                endpoint
+            );
+        }
+
+        Ok(())
+    }
+}
+
 impl Default for LlmFallbackConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            endpoint: default_endpoint(),
-            model: default_model(),
+            endpoint: None,
+            model: None,
             api_key: None,
             timeout_secs: default_timeout_secs(),
             temperature: default_temperature(),
@@ -74,16 +112,8 @@ impl Default for LlmFallbackConfig {
     }
 }
 
-fn default_endpoint() -> String {
-    "http://localhost:11434/v1".to_string()
-}
-
-fn default_model() -> String {
-    "llama3.2:3b".to_string()
-}
-
 fn default_timeout_secs() -> u64 {
-    5
+    60
 }
 
 fn default_temperature() -> f32 {

@@ -108,11 +108,22 @@ fn validate_config(config_path: PathBuf) -> Result<()> {
 
     let (deny_rules, allow_rules) = config.compile_rules().context("Failed to compile rules")?;
 
+    // Validate LLM fallback configuration if enabled
+    config.llm_fallback.validate().context("Invalid LLM fallback configuration")?;
+
     info!("Configuration is valid!");
     info!("  Deny rules: {}", deny_rules.len());
     info!("  Allow rules: {}", allow_rules.len());
     info!("  Log file: {}", config.logging.log_file.display());
     info!("  Log level: {}", config.logging.log_level);
+    if config.llm_fallback.enabled {
+        info!("  LLM fallback: ENABLED");
+        info!("    Endpoint: {}", config.llm_fallback.endpoint.as_ref().unwrap());
+        info!("    Model: {}", config.llm_fallback.model.as_ref().unwrap());
+        info!("    Timeout: {}s", config.llm_fallback.timeout_secs);
+    } else {
+        info!("  LLM fallback: disabled");
+    }
 
     Ok(())
 }
