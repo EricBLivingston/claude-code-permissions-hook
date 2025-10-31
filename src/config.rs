@@ -29,7 +29,9 @@ fn default_log_level() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct RuleConfig {
-    pub tool: String,
+    pub tool: Option<String>,
+    pub tool_regex: Option<String>,
+    pub tool_exclude_regex: Option<String>,
     pub file_path_regex: Option<String>,
     pub file_path_exclude_regex: Option<String>,
     pub command_regex: Option<String>,
@@ -42,7 +44,9 @@ pub struct RuleConfig {
 
 #[derive(Debug, Clone)]
 pub struct Rule {
-    pub tool: String,
+    pub tool: Option<String>,
+    pub tool_regex: Option<Regex>,
+    pub tool_exclude_regex: Option<Regex>,
     pub file_path_regex: Option<Regex>,
     pub file_path_exclude_regex: Option<Regex>,
     pub command_regex: Option<Regex>,
@@ -84,6 +88,27 @@ impl Config {
 }
 
 fn compile_rule(rule_config: &RuleConfig) -> Result<Rule> {
+    // Validate XOR: exactly one of tool or tool_regex must be specified
+    match (&rule_config.tool, &rule_config.tool_regex) {
+        (Some(_), Some(_)) => anyhow::bail!("Rule cannot have both 'tool' and 'tool_regex'"),
+        (None, None) => anyhow::bail!("Rule must have either 'tool' or 'tool_regex'"),
+        _ => {}
+    }
+
+    let tool_regex = rule_config
+        .tool_regex
+        .as_ref()
+        .map(|s| Regex::new(s))
+        .transpose()
+        .context("Invalid tool_regex")?;
+
+    let tool_exclude_regex = rule_config
+        .tool_exclude_regex
+        .as_ref()
+        .map(|s| Regex::new(s))
+        .transpose()
+        .context("Invalid tool_exclude_regex")?;
+
     let file_path_regex = rule_config
         .file_path_regex
         .as_ref()
@@ -135,6 +160,8 @@ fn compile_rule(rule_config: &RuleConfig) -> Result<Rule> {
 
     Ok(Rule {
         tool: rule_config.tool.clone(),
+        tool_regex,
+        tool_exclude_regex,
         file_path_regex,
         file_path_exclude_regex,
         command_regex,
@@ -154,7 +181,9 @@ mod tests {
     #[test]
     fn test_compile_rule() -> Result<()> {
         let rule_config = RuleConfig {
-            tool: "Read".to_string(),
+            tool: Some("Read".to_string()),
+            tool_regex: None,
+            tool_exclude_regex: None,
             file_path_regex: Some(r"^/home/.*".to_string()),
             file_path_exclude_regex: Some(r"\.\.".to_string()),
             command_regex: None,
@@ -166,7 +195,7 @@ mod tests {
         };
 
         let rule = compile_rule(&rule_config)?;
-        assert_eq!(rule.tool, "Read");
+        assert_eq!(rule.tool, Some("Read".to_string()));
         assert!(rule.file_path_regex.is_some());
         assert!(rule.file_path_exclude_regex.is_some());
 

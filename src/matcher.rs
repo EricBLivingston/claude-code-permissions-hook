@@ -19,7 +19,32 @@ pub fn check_rules(rules: &[Rule], input: &HookInput) -> Option<Decision> {
     );
 
     for (idx, rule) in rules.iter().enumerate() {
-        if rule.tool != input.tool_name {
+        // Check if tool matches (either exact or regex)
+        let tool_matches = if let Some(ref exact_tool) = rule.tool {
+            exact_tool == &input.tool_name
+        } else if let Some(ref regex_tool) = rule.tool_regex {
+            // Check main regex matches
+            if !regex_tool.is_match(&input.tool_name) {
+                false
+            } else if let Some(ref exclude_regex) = rule.tool_exclude_regex {
+                // Check exclude regex does NOT match
+                if exclude_regex.is_match(&input.tool_name) {
+                    debug!(
+                        "Rule {} tool matched but EXCLUDED by tool_exclude_regex: {}",
+                        idx, input.tool_name
+                    );
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        } else {
+            false // Should never happen due to config validation
+        };
+
+        if !tool_matches {
             trace!("Rule {} skipped - tool mismatch", idx);
             continue;
         }
@@ -81,7 +106,20 @@ fn check_rule(rule: &Rule, input: &HookInput) -> Option<Decision> {
                 ));
             }
         }
-        _ => {}
+        _ => {
+            // For unknown tools (like MCP tools), check if all field regexes are None
+            // If so, auto-allow based on tool name match alone
+            if rule.file_path_regex.is_none()
+                && rule.command_regex.is_none()
+                && rule.subagent_type.is_none()
+                && rule.prompt_regex.is_none()
+            {
+                return Some(Decision::Allow(format!(
+                    "Auto-allowed unknown tool: {}",
+                    input.tool_name
+                )));
+            }
+        }
     }
 
     None
@@ -166,7 +204,9 @@ mod tests {
     #[test]
     fn test_check_subagent_type() {
         let rule = Rule {
-            tool: "Task".to_string(),
+            tool: Some("Task".to_string()),
+            tool_regex: None,
+            tool_exclude_regex: None,
             file_path_regex: None,
             file_path_exclude_regex: None,
             command_regex: None,

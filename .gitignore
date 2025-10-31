@@ -1,3 +1,9 @@
 debug/
 target/
 /.vscode
+
+# Config files
+.claude/
+.serena/
+CLAUDE.md
+WARP.md

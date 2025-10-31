@@ -23,6 +23,15 @@ command_exclude_regex = "&|;|\\||`|\\$\\("
 tool = "Task"
 subagent_type = "codebase-analyzer"
 
+# Allow Context7 MCP tools for documentation lookup (extremely safe, read-only)
+#[[allow]]
+#tool_regex = "^mcp__context7__.*"
+
+# Example: Allow most MCP tools from a server, but exclude specific dangerous ones
+#[[allow]]
+#tool_regex = "^mcp__myserver__.*"
+#tool_exclude_regex = "^mcp__myserver__(delete|destroy|write)_"
+
 # Deny rules - checked first (take precedence)
 [[deny]]
 tool = "Bash"
