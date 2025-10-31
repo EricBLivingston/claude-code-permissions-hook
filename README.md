@@ -16,6 +16,7 @@ This has been largely "vibe coded" - I have checked all the code myself, but mos
 - You can allow tool/command combinations with specific regular-expression based filters
 - You can also deny tool/command combinations similarly
 - There is an extra "Allow X but not if Y matches" logic so you can keep regular expressions simpler for common cases
+- **NEW: LLM Fallback Safety Assessment** - When no explicit rule matches, optionally consult a local LLM (via Ollama or other OpenAI-compatible endpoints) to assess safety
 - Extensive logging is included - if you set logging to "verbose" it will log every PreToolUse call, very handy for diagnosing problems
 
 ## Installation
@@ -63,6 +64,113 @@ command_regex = "^rm .*-rf"
 [[deny]]
 tool = "Read"
 file_path_regex = "\\.(env|secret)$"
+
+# Optional: LLM Fallback (consult local LLM if no rule matches)
+[llm_fallback]
+enabled = false
+endpoint = "http://localhost:11434/v1"  # Ollama default
+model = "llama3.2:3b"
+timeout_secs = 5
+
+[llm_fallback.actions]
+on_safe = "allow"
+on_unsafe = "deny"
+on_unknown = "pass_through"
+```
+
+## LLM Fallback Setup (Optional)
+
+The LLM fallback feature allows the hook to consult a local language model when no explicit allow/deny rule matches. This provides intelligent safety assessment without requiring exhaustive rule definitions.
+
+### Prerequisites
+
+1. **Install Ollama** (if not already installed):
+   ```bash
+   curl -fsSL https://ollama.com/install.sh | sh
+   ```
+
+2. **Pull a model** (recommended: small, fast models):
+   ```bash
+   # Lightweight option (3B parameters, ~2GB)
+   ollama pull llama3.2:3b
+   
+   # Alternative lightweight models:
+   ollama pull phi3:mini        # Microsoft Phi-3 (3.8B)
+   ollama pull mistral:7b       # Mistral 7B
+   ```
+
+3. **Verify Ollama is running**:
+   ```bash
+   ollama list
+   # Should show your downloaded models
+   ```
+
+### Configuration
+
+Enable LLM fallback in your TOML config:
+
+```toml
+[llm_fallback]
+enabled = true
+endpoint = "http://localhost:11434/v1"
+model = "llama3.2:3b"  # Use the model you pulled
+timeout_secs = 5
+temperature = 0.1  # Low for consistent classification
+
+[llm_fallback.actions]
+on_safe = "allow"          # Allow operations classified as safe
+on_unsafe = "deny"         # Block operations classified as unsafe  
+on_unknown = "pass_through" # Defer to Claude Code for uncertain cases
+on_timeout = "pass_through" # What to do if LLM doesn't respond in time
+on_error = "pass_through"   # What to do if LLM errors out
+```
+
+### How LLM Assessment Works
+
+1. Hook receives tool use request with no matching rule
+2. Sends tool name and parameters to local LLM with classification prompt
+3. LLM responds with:
+   - **SAFE**: Read-only operations, standard dev commands (cargo, git, npm)
+   - **UNSAFE**: Destructive operations (rm -rf, writes to /etc, shell injection patterns)
+   - **UNKNOWN**: Cannot determine with confidence
+4. Hook applies configured action policy (allow/deny/pass_through) based on classification
+5. Decision is logged to the log file for review
+
+### Benefits
+
+- **Intelligent defaults**: No need to write rules for every tool/command
+- **Privacy-preserving**: Runs entirely locally (no data sent to external APIs)
+- **Fast**: Small models like llama3.2:3b respond in <1 second
+- **Graceful degradation**: Timeouts and errors fall back to normal Claude Code flow
+
+### Testing LLM Fallback
+
+Create a test config with LLM enabled but minimal rules:
+
+```bash
+# Create test config
+cat > test-llm-config.toml << 'EOF'
+[logging]
+log_file = "/tmp/claude-llm-test.log"
+log_level = "debug"
+
+[llm_fallback]
+enabled = true
+endpoint = "http://localhost:11434/v1"
+model = "llama3.2:3b"
+timeout_secs = 5
+
+[llm_fallback.actions]
+on_safe = "allow"
+on_unsafe = "deny"
+on_unknown = "pass_through"
+EOF
+
+# Test with a safe operation (should allow)
+cat tests/test_safe_read.json | cargo run -- run --config test-llm-config.toml
+
+# Check the log to see LLM reasoning
+tail -1 /tmp/claude-llm-test.log | jq
 ```
 
 ## Claude Code Setup
@@ -129,6 +237,9 @@ flowchart TB
     LogUse[Log tool use<br/>to file]
     CheckDeny@{shape: diamond, label: "Deny rule<br/>matches?"}
     CheckAllow@{shape: diamond, label: "Allow rule<br/>matches?"}
+    CheckLLM@{shape: diamond, label: "LLM fallback<br/>enabled?"}
+    CallLLM[Call local LLM<br/>for assessment]
+    LLMDecision@{shape: diamond, label: "LLM says?"}
     OutputDeny[Output deny decision<br/>to stdout]
     OutputAllow[Output allow decision<br/>to stdout]
     NoOutput[No output<br/>passthrough to<br/>Claude Code]
@@ -145,7 +256,15 @@ flowchart TB
     CheckDeny -->|No| CheckAllow
 
     CheckAllow -->|Yes| OutputAllow
-    CheckAllow -->|No| NoOutput
+    CheckAllow -->|No| CheckLLM
+
+    CheckLLM -->|Yes| CallLLM
+    CheckLLM -->|No| NoOutput
+
+    CallLLM --> LLMDecision
+    LLMDecision -->|SAFE/Allow| OutputAllow
+    LLMDecision -->|UNSAFE/Deny| OutputDeny
+    LLMDecision -->|UNKNOWN/Pass| NoOutput
 
     OutputDeny --> EndDeny
     OutputAllow --> EndAllow
@@ -173,7 +292,11 @@ flowchart TB
 3. **Log Tool Use**: Write to log file (non-fatal, won't block on errors)
 4. **Check Deny Rules**: If any deny rule matches, output deny decision
 5. **Check Allow Rules**: If any allow rule matches, output allow decision
-6. **No Match**: Exit with no output (normal Claude Code permission flow)
+6. **LLM Fallback** (optional): If enabled and no rule matched, consult local LLM
+   - Sends tool info to LLM for safety classification (SAFE/UNSAFE/UNKNOWN)
+   - Applies configured action policy based on LLM response
+   - Handles timeouts and errors gracefully
+7. **No Match**: Exit with no output (normal Claude Code permission flow)
 
 ### Rule Matching Logic
 

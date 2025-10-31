@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod hook_io;
+pub mod llm_safety;
 pub mod logging;
 pub mod matcher;
 
@@ -41,7 +42,7 @@ enum Commands {
     },
 }
 
-fn run_hook(config_path: PathBuf) -> Result<()> {
+async fn run_hook(config_path: PathBuf) -> Result<()> {
     let config = Config::load_from_file(&config_path).context("Failed to load configuration")?;
 
     let (deny_rules, allow_rules) = config.compile_rules().context("Failed to compile rules")?;
@@ -77,7 +78,22 @@ fn run_hook(config_path: PathBuf) -> Result<()> {
         }
     }
 
-    // No match - exit with no output (normal flow)
+    // No match - check LLM fallback if enabled
+    if config.llm_fallback.enabled {
+        info!("No rules matched - using LLM fallback for assessment");
+        let result = llm_safety::assess_with_llm(&config.llm_fallback, &input).await;
+        if let Some(output) = llm_safety::apply_llm_result(
+            &config.logging.log_file,
+            &input,
+            &config.llm_fallback.actions,
+            result,
+        ) {
+            output.write_to_stdout()?;
+            return Ok(());
+        }
+    }
+
+    // No match and no LLM decision - exit with no output (normal flow)
     Ok(())
 }
 
@@ -95,7 +111,8 @@ fn validate_config(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let opts = Opts::parse();
 
     // Load config to get log level
@@ -110,7 +127,7 @@ fn main() -> Result<()> {
         .init();
 
     match opts.command {
-        Commands::Run { config } => run_hook(config),
+        Commands::Run { config } => run_hook(config).await,
         Commands::Validate { config } => validate_config(config),
     }
 }

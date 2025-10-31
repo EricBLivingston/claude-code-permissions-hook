@@ -1,0 +1,10 @@
+{
+  "session_id": "test-session-789",
+  "transcript_path": "/tmp/transcript.txt",
+  "cwd": "/home/user/project",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cargo test"
+  }
+}

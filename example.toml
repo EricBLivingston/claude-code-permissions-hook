@@ -44,3 +44,11 @@ file_path_regex = "\\.(env|secret)$"
 [[deny]]
 tool = "Read"
 file_path_regex = ".*\\.\\./.*"
+
+# Include shared LLM fallback configuration
+# To enable LLM fallback, edit llm-fallback-config.toml and set enabled = true
+# You can include multiple config files, and they support absolute (/path) or relative (path) references
+[includes]
+files = [
+    "llm-fallback-config.toml",
+]

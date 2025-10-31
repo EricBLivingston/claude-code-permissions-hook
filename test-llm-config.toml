@@ -1,0 +1,16 @@
+[logging]
+log_file = "/tmp/claude-llm-test.log"
+log_level = "debug"
+
+# No explicit allow/deny rules - everything goes to LLM
+
+# Include shared LLM fallback configuration
+[includes]
+files = [
+    "llm-fallback-config.toml",
+]
+
+# Override settings for testing (enabled with longer timeout)
+[llm_fallback]
+enabled = true
+timeout_secs = 30

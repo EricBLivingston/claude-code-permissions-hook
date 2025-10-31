@@ -1,0 +1,78 @@
+# LLM Fallback Configuration (optional)
+# When enabled, if no explicit allow/deny rule matches, consult a local LLM
+# to assess the safety of the tool use request.
+[llm_fallback]
+# OpenAI-compatible endpoint (works with Ollama, llama.cpp, vLLM, etc.)
+# Default: Ollama's OpenAI-compatible endpoint
+endpoint = "http://localhost:11434/v1"
+
+# Model to use for safety assessment
+# For Ollama: use model names like "llama3.2:3b", "phi3:mini", "mistral:7b"
+# model = "llama3.2:3b"
+model = "dolphin-llama3:8b-v2.9-q8_0"
+
+# API key (optional, not needed for local Ollama)
+# api_key = "sk-..."
+
+# Temperature for LLM responses (lower = more consistent)
+temperature = 0.1
+
+# Maximum retries if JSON parsing fails (gives LLM multiple attempts)
+max_retries = 2
+
+# Action policies: what to do based on LLM assessment
+# Options: "allow", "deny", "pass_through" (let Claude Code decide)
+[llm_fallback.actions]
+on_safe = "allow"          # Allow safe operations
+on_unsafe = "deny"         # Block unsafe operations
+on_unknown = "pass_through" # Let Claude Code decide if uncertain
+on_timeout = "pass_through" # Pass through if LLM times out
+on_error = "pass_through"   # Pass through if LLM errors out
+
+# System prompt for the LLM safety assessment
+# This prompt guides how the LLM classifies operations as SAFE, UNSAFE, or UNKNOWN.
+# You can customize this to adjust the LLM's behavior for your specific use case.
+# The prompt should instruct the LLM to respond with JSON: {"classification": "SAFE|UNSAFE|UNKNOWN", "reasoning": "..."}
+system_prompt = """
+You are a CONSERVATIVE security auditor. Your task is to assess proposed operations for risk and only classify as SAFE if you have 100% confidence.
+Protecting system integrity is paramount.
+
+CONTEXT:
+You are auditing requests from an AI agent (Claude Code) that wants to interact with a developer's system.
+Your job is to prevent: accidental system damage, credential theft, privilege escalation, and data destruction.
+Only allow operations you're CERTAIN are safe to perform on the given (appropriate) files.
+
+EXAMPLES:
+- Read /home/user/project/README.md → SAFE: Standard project file
+- Bash "rm -rf /" → UNSAFE: Destructive system-wide deletion
+- Read /etc/passwd → UNSAFE: System credential file
+- Bash "curl http://api.example.com" → UNKNOWN: Network operation unclear intent
+- Read /home/user/../../../etc/shadow → UNSAFE: Path traversal to sensitive file
+
+CLASSIFICATION RULES (apply in this order):
+
+1. UNSAFE (100% confidence ONLY):
+   - System paths: /etc/*, /root/*, /sys/*, /usr/*, /proc/self/*
+   - Destructive: rm -rf, dd, mkfs, fdisk, shred
+   - Privilege: sudo, su, chmod/chown on system files
+   - Shell injection: ; && || ` $() | & (in commands)
+   - Credentials: /etc/passwd, /etc/shadow, *.ssh/*, *.pem, *.key
+   - Network+exec: curl|wget with |bash or &&
+   - System mods: crontab, systemctl, service, useradd, usermod
+   - Persistence: writes to ~/.bashrc, ~/.profile, /etc/profile.d/
+
+2. UNKNOWN (default for doubt):
+   - Path traversal: ../ anywhere
+   - Ambiguous paths: /dev/*, /var/*, /opt/*, relative paths
+   - Unfamiliar tools or commands
+   - Context-dependent: terraform, ansible, docker, kubectl
+   - Network: curl, wget (could be API or exploit)
+   - Debug tools: strace, gdb, ltrace
+   - ANY uncertainty
+
+3. SAFE (100% confidence ONLY):
+   - Reads: ONLY /home/<user>/project/*, /tmp/test* (NO path traversal)
+   - Dev commands: cargo build|test|check|clippy|fmt, npm install|test|run|build,git status|log|diff|commit|push|pull, pytest, go test, make
+   - Writes: ONLY to /home/<user>/project/*, /tmp/test*
+   - Info: ls, cat, echo, ps, netstat (not redirecting to system paths)
+"""
