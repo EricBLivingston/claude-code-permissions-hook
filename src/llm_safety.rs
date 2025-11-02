@@ -3,12 +3,12 @@
 
 use crate::config::LlmFallbackConfig;
 use crate::hook_io::{HookInput, HookOutput};
-use crate::logging::log_llm_decision;
+use crate::logging::{create_llm_metadata, LlmMetadata};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,11 +31,11 @@ struct LlmResponse {
 }
 
 /// Main entry point for LLM safety assessment
-pub async fn assess_with_llm(config: &LlmFallbackConfig, input: &HookInput) -> AssessmentResult {
-    debug!(
-        "Starting LLM safety assessment for tool: {}",
-        input.tool_name
-    );
+/// Returns (result, processing_time_ms)
+pub async fn assess_with_llm(config: &LlmFallbackConfig, input: &HookInput) -> (AssessmentResult, u64) {
+    debug!("Starting LLM assessment for {}", input.tool_name);
+
+    let start = Instant::now();
 
     let result = timeout(
         Duration::from_secs(config.timeout_secs),
@@ -43,77 +43,106 @@ pub async fn assess_with_llm(config: &LlmFallbackConfig, input: &HookInput) -> A
     )
     .await;
 
-    match result {
+    let processing_time_ms = start.elapsed().as_millis() as u64;
+
+    let assessment_result = match result {
         Ok(Ok(assessment)) => {
-            debug!("LLM assessment completed: {:?}", assessment);
+            debug!("LLM assessment completed in {}ms: {:?}", processing_time_ms, assessment);
             AssessmentResult::Assessment(assessment)
         }
         Ok(Err(e)) => {
-            error!("LLM call failed: {}", e);
+            error!("LLM call failed after {}ms: {}", processing_time_ms, e);
             AssessmentResult::Error(e.to_string())
         }
         Err(_) => {
-            warn!("LLM call timed out after {} seconds", config.timeout_secs);
+            warn!("LLM timeout after {}ms", processing_time_ms);
             AssessmentResult::Timeout
         }
-    }
+    };
+
+    (assessment_result, processing_time_ms)
 }
 
-/// Apply LLM result with fixed binary actions
+/// Apply LLM result and create metadata
+/// Returns Option<(HookOutput, LlmMetadata)>
 pub fn apply_llm_result(
-    log_path: &std::path::Path,
-    input: &HookInput,
-    result: AssessmentResult,
+    _input: &HookInput,
+    result: (AssessmentResult, u64),
     test_mode: bool,
-) -> Option<HookOutput> {
+) -> Option<(HookOutput, LlmMetadata)> {
     use AssessmentResult::*;
     use SafetyAssessment::*;
 
-    let output = match result {
+    let (assessment_result, processing_time_ms) = result;
+
+    // Get model from config - simplified for now
+    let model = "llm-fallback".to_string();
+
+    match assessment_result {
         Assessment(Allow(r)) => {
-            let reasoning = format!("LLM-ALLOW: {}", r);
-            info!("Auto-approving: {}", reasoning);
-            let hook_output = HookOutput::allow(reasoning);
-            log_llm_decision(log_path, input, "ALLOW", &hook_output);
-            Some(hook_output)
+            let reasoning = format!("LLM: {}", r);
+            info!("LLM Allow: {}", reasoning);
+            let hook_output = HookOutput::allow(reasoning.clone());
+            let metadata = create_llm_metadata(
+                "ALLOW",
+                &r,
+                &model,
+                Some(processing_time_ms),
+                None,
+            );
+            Some((hook_output, metadata))
         }
         Assessment(Query(r)) => {
-            let reasoning = format!("LLM-QUERY: {}", r);
-            info!("Sending to user: {}", reasoning);
-            let hook_output = HookOutput::deny(reasoning);
-            log_llm_decision(log_path, input, "QUERY", &hook_output);
-            // In test mode, output the decision; otherwise pass through
+            let reasoning = format!("LLM Query: {}", r);
+            info!("{}", reasoning);
+            let hook_output = HookOutput::deny(reasoning.clone());
+            let metadata = create_llm_metadata(
+                "QUERY",
+                &r,
+                &model,
+                Some(processing_time_ms),
+                None,
+            );
+            // In test mode, output; otherwise pass through
             if test_mode {
-                Some(hook_output)
+                Some((hook_output, metadata))
             } else {
                 None
             }
         }
         Timeout => {
-            warn!("LLM timeout - passing to user for review");
+            warn!("LLM timeout");
             let hook_output = HookOutput::deny("LLM timeout".to_string());
-            log_llm_decision(log_path, input, "TIMEOUT", &hook_output);
-            // In test mode, output the decision; otherwise pass through
+            let metadata = create_llm_metadata(
+                "TIMEOUT",
+                "Request timed out",
+                &model,
+                Some(processing_time_ms),
+                None,
+            );
             if test_mode {
-                Some(hook_output)
+                Some((hook_output, metadata))
             } else {
                 None
             }
         }
         Error(e) => {
-            error!("LLM error: {} - passing to user for review", e);
+            error!("LLM error: {}", e);
             let hook_output = HookOutput::deny(format!("LLM error: {}", e));
-            log_llm_decision(log_path, input, "ERROR", &hook_output);
-            // In test mode, output the decision; otherwise pass through
+            let metadata = create_llm_metadata(
+                "ERROR",
+                &e,
+                &model,
+                Some(processing_time_ms),
+                None,
+            );
             if test_mode {
-                Some(hook_output)
+                Some((hook_output, metadata))
             } else {
                 None
             }
         }
-    };
-
-    output
+    }
 }
 
 async fn call_llm(config: &LlmFallbackConfig, input: &HookInput) -> Result<SafetyAssessment> {
@@ -249,25 +278,17 @@ fn build_safety_prompt(input: &HookInput) -> String {
     let params =
         serde_json::to_string_pretty(&input.tool_input).unwrap_or_else(|_| "{}".to_string());
 
-    format!(r#"Classify this operation as ALLOW or QUERY.
-
-ALLOW = Clearly safe development operation, auto-approve
-QUERY = Anything else (unsafe, ambiguous, unfamiliar) - user will review
+    format!(r#"Evaluate this tool use request:
 
 Tool: {}
 Parameters:
 {}
 
-CRITICAL: Only use ALLOW if you are 100% confident the operation is safe.
-CRITICAL: When in doubt, always use QUERY.
-
-Respond in this exact JSON format:
+Classify as ALLOW or QUERY following your instructions above. Respond in this exact JSON format:
 {{
   "classification": "ALLOW|QUERY",
   "reasoning": "brief explanation"
-}}
-
-Respond ONLY with valid JSON."#,
+}}"#,
         input.tool_name, params
     )
 }
@@ -300,9 +321,6 @@ fn parse_llm_response(content: &str) -> Result<SafetyAssessment> {
     match response.classification.to_uppercase().as_str() {
         "ALLOW" => Ok(SafetyAssessment::Allow(response.reasoning)),
         "QUERY" => Ok(SafetyAssessment::Query(response.reasoning)),
-        // Handle legacy responses during transition
-        "SAFE" => Ok(SafetyAssessment::Allow(response.reasoning)),
-        "UNSAFE" | "UNKNOWN" => Ok(SafetyAssessment::Query(response.reasoning)),
         other => anyhow::bail!("Invalid classification '{}' - must be ALLOW or QUERY", other),
     }
 }
@@ -323,56 +341,57 @@ mod tests {
 
     #[test]
     fn test_parse_llm_response_plain() {
-        let json = r#"{"classification": "SAFE", "reasoning": "Read-only operation"}"#;
+        let json = r#"{"classification": "ALLOW", "reasoning": "Read-only operation"}"#;
         let result = parse_llm_response(json).unwrap();
         assert_eq!(
             result,
-            SafetyAssessment::Safe("Read-only operation".to_string())
+            SafetyAssessment::Allow("Read-only operation".to_string())
         );
     }
 
     #[test]
     fn test_parse_llm_response_with_preamble() {
         let response = r#"Sure, here's my assessment:
-{"classification": "UNSAFE", "reasoning": "Destructive command"}
+{"classification": "QUERY", "reasoning": "Destructive command"}
 Hope this helps!"#;
         let result = parse_llm_response(response).unwrap();
         assert_eq!(
             result,
-            SafetyAssessment::Unsafe("Destructive command".to_string())
+            SafetyAssessment::Query("Destructive command".to_string())
         );
     }
 
     #[test]
     fn test_parse_llm_response_markdown() {
         let json = r#"```json
-{"classification": "SAFE", "reasoning": "Safe operation"}
+{"classification": "ALLOW", "reasoning": "Safe operation"}
 ```"#;
         let result = parse_llm_response(json).unwrap();
         assert_eq!(
             result,
-            SafetyAssessment::Safe("Safe operation".to_string())
+            SafetyAssessment::Allow("Safe operation".to_string())
         );
     }
 
     #[test]
     fn test_parse_llm_response_malformed_json() {
         // Trailing comma - simple_json_repair should fix this
-        let json = r#"{"classification": "UNKNOWN", "reasoning": "Cannot determine",}"#;
+        let json = r#"{"classification": "QUERY", "reasoning": "Cannot determine",}"#;
         let result = parse_llm_response(json).unwrap();
         assert_eq!(
             result,
-            SafetyAssessment::Unknown("Cannot determine".to_string())
+            SafetyAssessment::Query("Cannot determine".to_string())
         );
     }
 
     #[test]
-    fn test_parse_llm_response_unknown() {
+    fn test_parse_llm_response_legacy_unknown() {
+        // Test legacy UNKNOWN classification (maps to Query)
         let json = r#"{"classification": "UNKNOWN", "reasoning": "Cannot determine"}"#;
         let result = parse_llm_response(json).unwrap();
         assert_eq!(
             result,
-            SafetyAssessment::Unknown("Cannot determine".to_string())
+            SafetyAssessment::Query("Cannot determine".to_string())
         );
     }
 

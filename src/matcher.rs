@@ -5,34 +5,35 @@ use crate::config::Rule;
 use crate::hook_io::HookInput;
 use log::{debug, trace};
 
-#[derive(Debug)]
-pub enum Decision {
-    Allow(String),
-    Deny(String),
+#[derive(Debug, Clone)]
+pub struct DecisionInfo {
+    pub decision: DecisionType,
+    pub reasoning: String,
+    pub rule_index: usize,
+    pub matched_pattern: String,
+    pub rule_id: String,
+    pub section_name: String,
 }
 
-pub fn check_rules(rules: &[Rule], input: &HookInput) -> Option<Decision> {
-    trace!(
-        "Checking {} rules for tool: {}",
-        rules.len(),
-        input.tool_name
-    );
+#[derive(Debug, Clone)]
+pub enum DecisionType {
+    Allow,
+    Deny,
+}
+
+pub fn check_rules(rules: &[Rule], input: &HookInput) -> Option<DecisionInfo> {
+    trace!("Checking {} rules for {}", rules.len(), input.tool_name);
 
     for (idx, rule) in rules.iter().enumerate() {
-        // Check if tool matches (either exact or regex)
+        // Check if tool matches (exact or regex)
         let tool_matches = if let Some(ref exact_tool) = rule.tool {
             exact_tool == &input.tool_name
         } else if let Some(ref regex_tool) = rule.tool_regex {
-            // Check main regex matches
             if !regex_tool.is_match(&input.tool_name) {
                 false
             } else if let Some(ref exclude_regex) = rule.tool_exclude_regex {
-                // Check exclude regex does NOT match
                 if exclude_regex.is_match(&input.tool_name) {
-                    debug!(
-                        "Rule {} tool matched but EXCLUDED by tool_exclude_regex: {}",
-                        idx, input.tool_name
-                    );
+                    debug!("Rule {} tool matched but excluded: {}", idx, input.tool_name);
                     false
                 } else {
                     true
@@ -41,7 +42,7 @@ pub fn check_rules(rules: &[Rule], input: &HookInput) -> Option<Decision> {
                 true
             }
         } else {
-            false // Should never happen due to config validation
+            false
         };
 
         if !tool_matches {
@@ -49,17 +50,24 @@ pub fn check_rules(rules: &[Rule], input: &HookInput) -> Option<Decision> {
             continue;
         }
 
-        trace!("Evaluating rule {} for tool: {}", idx, input.tool_name);
-        if let Some(decision) = check_rule(rule, input) {
-            debug!("Rule {} matched: {:?}", idx, decision);
-            return Some(decision);
+        trace!("Evaluating rule {} for {}", idx, input.tool_name);
+        if let Some((reasoning, pattern)) = check_rule(rule, input) {
+            debug!("Rule {} matched: {}", idx, pattern);
+            return Some(DecisionInfo {
+                decision: DecisionType::Allow,
+                reasoning,
+                rule_index: idx,
+                matched_pattern: pattern,
+                rule_id: rule.id.clone(),
+                section_name: rule.section_name.clone(),
+            });
         }
     }
-    trace!("No rules matched for tool: {}", input.tool_name);
+    trace!("No rules matched for {}", input.tool_name);
     None
 }
 
-fn check_rule(rule: &Rule, input: &HookInput) -> Option<Decision> {
+fn check_rule(rule: &Rule, input: &HookInput) -> Option<(String, String)> {
     match input.tool_name.as_str() {
         "Read" | "Write" | "Edit" | "Glob" => {
             if let Some(file_path) = input.extract_field("file_path")
@@ -69,10 +77,8 @@ fn check_rule(rule: &Rule, input: &HookInput) -> Option<Decision> {
                     &rule.file_path_exclude_regex,
                 )
             {
-                return Some(Decision::Allow(format!(
-                    "Matched rule for {} with file_path: {}",
-                    input.tool_name, file_path
-                )));
+                let reasoning = format!("Rule {}, file_path: {}", input.tool_name, file_path);
+                return Some((reasoning, "file_path_regex".to_string()));
             }
         }
         "Bash" => {
@@ -83,41 +89,33 @@ fn check_rule(rule: &Rule, input: &HookInput) -> Option<Decision> {
                     &rule.command_exclude_regex,
                 )
             {
-                return Some(Decision::Allow(format!(
-                    "Matched rule for Bash with command: {}",
-                    command
-                )));
+                let reasoning = format!("Bash, command: {}", command);
+                return Some((reasoning, "command_regex".to_string()));
             }
         }
         "Task" => {
             if let Some(subagent_type) = input.extract_field("subagent_type")
                 && check_subagent_type(rule, &subagent_type)
             {
-                return Some(Decision::Allow(format!(
-                    "Matched rule for Task with subagent_type: {}",
-                    subagent_type
-                )));
+                let reasoning = format!("Task, subagent: {}", subagent_type);
+                return Some((reasoning, "subagent_type".to_string()));
             }
             if let Some(prompt) = input.extract_field("prompt")
                 && check_field_with_exclude(&prompt, &rule.prompt_regex, &rule.prompt_exclude_regex)
             {
-                return Some(Decision::Allow(
-                    "Matched rule for Task with prompt pattern".to_string(),
-                ));
+                let reasoning = "Task, prompt pattern matched".to_string();
+                return Some((reasoning, "prompt_regex".to_string()));
             }
         }
         _ => {
-            // For unknown tools (like MCP tools), check if all field regexes are None
-            // If so, auto-allow based on tool name match alone
+            // MCP tools: auto-allow if no field patterns specified
             if rule.file_path_regex.is_none()
                 && rule.command_regex.is_none()
                 && rule.subagent_type.is_none()
                 && rule.prompt_regex.is_none()
             {
-                return Some(Decision::Allow(format!(
-                    "Auto-allowed unknown tool: {}",
-                    input.tool_name
-                )));
+                let reasoning = format!("Tool: {}", input.tool_name);
+                return Some((reasoning, "tool_regex".to_string()));
             }
         }
     }
@@ -132,56 +130,47 @@ fn check_field_with_exclude(
 ) -> bool {
     if let Some(regex) = main_regex {
         if !regex.is_match(value) {
-            trace!("Main regex didn't match value: {}", value);
+            trace!("Main regex no match: {}", value);
             return false;
         }
         if let Some(exclude) = exclude_regex
             && exclude.is_match(value)
         {
-            debug!(
-                "Rule matched but EXCLUDED by exclude pattern. Value: {}",
-                value
-            );
+            trace!("Exclude regex matched: {}", value);
             return false;
         }
-        trace!("Field matched: {}", value);
-        return true;
+        true
+    } else {
+        false
     }
-    false
 }
 
 fn check_subagent_type(rule: &Rule, subagent_type: &str) -> bool {
-    if let Some(ref expected_type) = rule.subagent_type {
-        if expected_type != subagent_type {
-            trace!(
-                "Subagent type didn't match. Expected: {}, got: {}",
-                expected_type, subagent_type
-            );
+    if let Some(ref expected) = rule.subagent_type {
+        if expected != subagent_type {
             return false;
         }
-        if let Some(ref exclude) = rule.subagent_type_exclude_regex
-            && exclude.is_match(subagent_type)
+        if let Some(ref exclude_regex) = rule.subagent_type_exclude_regex
+            && exclude_regex.is_match(subagent_type)
         {
-            debug!(
-                "Subagent type matched but EXCLUDED by exclude pattern: {}",
-                subagent_type
-            );
+            trace!("Subagent type excluded: {}", subagent_type);
             return false;
         }
-        trace!("Subagent type matched: {}", subagent_type);
-        return true;
+        true
+    } else {
+        false
     }
-    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Rule;
     use regex::Regex;
 
     #[test]
     fn test_check_field_with_exclude() {
-        let main_regex = Some(Regex::new(r"^/home/.*").unwrap());
+        let main_regex = Some(Regex::new(r"^/home/").unwrap());
         let exclude_regex = Some(Regex::new(r"\.\.").unwrap());
 
         assert!(check_field_with_exclude(
@@ -204,6 +193,9 @@ mod tests {
     #[test]
     fn test_check_subagent_type() {
         let rule = Rule {
+            id: "test-task".to_string(),
+            section_name: "test-section".to_string(),
+            description: None,
             tool: Some("Task".to_string()),
             tool_regex: None,
             tool_exclude_regex: None,
@@ -211,13 +203,13 @@ mod tests {
             file_path_exclude_regex: None,
             command_regex: None,
             command_exclude_regex: None,
-            subagent_type: Some("codebase-analyzer".to_string()),
+            subagent_type: Some("Explore".to_string()),
             subagent_type_exclude_regex: None,
             prompt_regex: None,
             prompt_exclude_regex: None,
         };
 
-        assert!(check_subagent_type(&rule, "codebase-analyzer"));
-        assert!(!check_subagent_type(&rule, "other-agent"));
+        assert!(check_subagent_type(&rule, "Explore"));
+        assert!(!check_subagent_type(&rule, "Plan"));
     }
 }

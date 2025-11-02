@@ -4,32 +4,83 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub llm_fallback: LlmFallbackConfig,
+    #[serde(default)]
+    pub includes: IncludesConfig,
+    #[serde(flatten)]
+    pub sections: HashMap<String, SectionConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct IncludesConfig {
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SectionConfig {
+    pub description: Option<String>,
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub allow: Vec<RuleConfig>,
     #[serde(default)]
     pub deny: Vec<RuleConfig>,
-    #[serde(default)]
-    pub llm_fallback: LlmFallbackConfig,
 }
 
-#[derive(Debug, Deserialize)]
-struct IncludesSection {
-    #[serde(default)]
-    files: Vec<String>,
+fn default_priority() -> u32 {
+    50
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+pub struct CompiledConfig {
+    pub logging: LoggingConfig,
+    pub llm_fallback: LlmFallbackConfig,
+    pub deny_rules: Vec<Rule>,
+    pub allow_rules: Vec<Rule>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct LoggingConfig {
+    #[serde(default = "default_log_file")]
     pub log_file: PathBuf,
+    #[serde(default = "default_review_log_file")]
+    pub review_log_file: PathBuf,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            log_file: default_log_file(),
+            review_log_file: default_review_log_file(),
+            log_level: default_log_level(),
+        }
+    }
+}
+
+fn default_log_file() -> PathBuf {
+    PathBuf::from("/tmp/claude-tool-use.log")
+}
+
+fn default_review_log_file() -> PathBuf {
+    PathBuf::from("/tmp/claude-decisions-review.log")
 }
 
 fn default_log_level() -> String {
@@ -171,6 +222,11 @@ CLASSIFICATION RULES (apply in this order):
 
 #[derive(Debug, Deserialize)]
 pub struct RuleConfig {
+    // REQUIRED - validation will check this
+    pub id: String,
+    #[serde(default)]
+    pub description: Option<String>,
+
     pub tool: Option<String>,
     pub tool_regex: Option<String>,
     pub tool_exclude_regex: Option<String>,
@@ -186,6 +242,10 @@ pub struct RuleConfig {
 
 #[derive(Debug, Clone)]
 pub struct Rule {
+    pub id: String,
+    pub section_name: String,
+    pub description: Option<String>,
+
     pub tool: Option<String>,
     pub tool_regex: Option<Regex>,
     pub tool_exclude_regex: Option<Regex>,
@@ -200,13 +260,97 @@ pub struct Rule {
 }
 
 impl Config {
-    pub fn load_from_file(path: &Path) -> Result<Self> {
+    pub fn load_from_file(path: &Path) -> Result<CompiledConfig> {
         let merged_toml = Self::load_with_includes(path)?;
-        
+
         let config: Config = toml::from_str(&merged_toml.to_string())
             .with_context(|| format!("Failed to parse TOML config: {}", path.display()))?;
 
-        Ok(config)
+        config.validate()?;
+        config.compile()
+    }
+
+    fn validate(&self) -> Result<()> {
+        const RESERVED_NAMES: &[&str] = &["logging", "llm_fallback", "includes"];
+        let kebab_case_regex = Regex::new(r"^[a-z][a-z0-9-]*$").unwrap();
+
+        // Check for reserved section names
+        for reserved in RESERVED_NAMES {
+            if self.sections.contains_key(*reserved) {
+                anyhow::bail!(
+                    "Invalid section name '{}' - this is a reserved name. \
+                     Reserved names: logging, llm_fallback, includes",
+                    reserved
+                );
+            }
+        }
+
+        // Validate kebab-case section names
+        for section_name in self.sections.keys() {
+            if !kebab_case_regex.is_match(section_name) {
+                anyhow::bail!(
+                    "Invalid section name '{}' - section names must be kebab-case \
+                     (lowercase letters, numbers, and hyphens only, starting with a letter). \
+                     Example: 'build-tools', 'file-operations'",
+                    section_name
+                );
+            }
+        }
+
+        // Validate rule ID uniqueness globally
+        let mut seen_ids = std::collections::HashSet::new();
+        for (section_name, section) in &self.sections {
+            for rule in section.deny.iter().chain(section.allow.iter()) {
+                if !seen_ids.insert(&rule.id) {
+                    anyhow::bail!(
+                        "Duplicate rule ID '{}' in section '{}'. \
+                         Rule IDs must be unique across all sections.",
+                        rule.id,
+                        section_name
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn compile(self) -> Result<CompiledConfig> {
+        // Collect sections with their names and sort by priority
+        let mut sections: Vec<(String, SectionConfig)> = self.sections.into_iter()
+            .filter(|(_, section)| section.enabled)
+            .collect();
+
+        // Sort by priority (lower number = higher priority), then alphabetically by name
+        sections.sort_by(|(name_a, section_a), (name_b, section_b)| {
+            section_a.priority.cmp(&section_b.priority)
+                .then_with(|| name_a.cmp(name_b))
+        });
+
+        // Flatten deny rules in priority order
+        let mut deny_rules = Vec::new();
+        for (section_name, section) in &sections {
+            for rule_config in &section.deny {
+                let rule = compile_rule(rule_config, section_name)?;
+                deny_rules.push(rule);
+            }
+        }
+
+        // Flatten allow rules in priority order
+        let mut allow_rules = Vec::new();
+        for (section_name, section) in &sections {
+            for rule_config in &section.allow {
+                let rule = compile_rule(rule_config, section_name)?;
+                allow_rules.push(rule);
+            }
+        }
+
+        Ok(CompiledConfig {
+            logging: self.logging,
+            llm_fallback: self.llm_fallback,
+            deny_rules,
+            allow_rules,
+        })
     }
 
     fn load_with_includes(path: &Path) -> Result<Table> {
@@ -218,26 +362,37 @@ impl Config {
 
         let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
-        // Process includes if they exist
-        if let Some(Value::Table(includes_section)) = toml_table.remove("includes") {
+        // Collect include paths first to avoid borrow checker issues
+        let include_paths: Vec<PathBuf> = if let Some(Value::Table(includes_section)) = toml_table.get("includes") {
             if let Some(Value::Array(files)) = includes_section.get("files") {
-                for file_value in files {
-                    if let Value::String(include_path) = file_value {
-                        // Resolve path: absolute if starts with /, relative to base_dir otherwise
-                        let include_file = if include_path.starts_with('/') {
-                            PathBuf::from(include_path)
+                files.iter()
+                    .filter_map(|file_value| {
+                        if let Value::String(include_path) = file_value {
+                            // Resolve path: absolute if starts with /, relative to base_dir otherwise
+                            Some(if include_path.starts_with('/') {
+                                PathBuf::from(include_path)
+                            } else {
+                                base_dir.join(include_path)
+                            })
                         } else {
-                            base_dir.join(include_path)
-                        };
-
-                        let include_table = Self::load_with_includes(&include_file)
-                            .with_context(|| format!("Failed to load included file: {}", include_file.display()))?;
-
-                        // Merge include_table into toml_table, with toml_table taking precedence
-                        Self::merge_tables(&mut toml_table, include_table);
-                    }
-                }
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
             }
+        } else {
+            Vec::new()
+        };
+
+        // Now load and merge includes
+        for include_file in include_paths {
+            let include_table = Self::load_with_includes(&include_file)
+                .with_context(|| format!("Failed to load included file: {}", include_file.display()))?;
+
+            // Merge include_table into toml_table, with toml_table taking precedence
+            Self::merge_tables(&mut toml_table, include_table);
         }
 
         Ok(toml_table)
@@ -260,31 +415,21 @@ impl Config {
             }
         }
     }
-
-    pub fn compile_rules(&self) -> Result<(Vec<Rule>, Vec<Rule>)> {
-        let deny_rules = self
-            .deny
-            .iter()
-            .map(compile_rule)
-            .collect::<Result<Vec<_>>>()
-            .context("Failed to compile deny rules")?;
-
-        let allow_rules = self
-            .allow
-            .iter()
-            .map(compile_rule)
-            .collect::<Result<Vec<_>>>()
-            .context("Failed to compile allow rules")?;
-
-        Ok((deny_rules, allow_rules))
-    }
 }
 
-fn compile_rule(rule_config: &RuleConfig) -> Result<Rule> {
+fn compile_rule(rule_config: &RuleConfig, section_name: &str) -> Result<Rule> {
     // Validate XOR: exactly one of tool or tool_regex must be specified
     match (&rule_config.tool, &rule_config.tool_regex) {
-        (Some(_), Some(_)) => anyhow::bail!("Rule cannot have both 'tool' and 'tool_regex'"),
-        (None, None) => anyhow::bail!("Rule must have either 'tool' or 'tool_regex'"),
+        (Some(_), Some(_)) => anyhow::bail!(
+            "Rule '{}' in section '{}' cannot have both 'tool' and 'tool_regex'",
+            rule_config.id,
+            section_name
+        ),
+        (None, None) => anyhow::bail!(
+            "Rule '{}' in section '{}' must have either 'tool' or 'tool_regex'",
+            rule_config.id,
+            section_name
+        ),
         _ => {}
     }
 
@@ -293,65 +438,68 @@ fn compile_rule(rule_config: &RuleConfig) -> Result<Rule> {
         .as_ref()
         .map(|s| Regex::new(s))
         .transpose()
-        .context("Invalid tool_regex")?;
+        .with_context(|| format!("Invalid tool_regex in rule '{}' (section '{}')", rule_config.id, section_name))?;
 
     let tool_exclude_regex = rule_config
         .tool_exclude_regex
         .as_ref()
         .map(|s| Regex::new(s))
         .transpose()
-        .context("Invalid tool_exclude_regex")?;
+        .with_context(|| format!("Invalid tool_exclude_regex in rule '{}' (section '{}')", rule_config.id, section_name))?;
 
     let file_path_regex = rule_config
         .file_path_regex
         .as_ref()
         .map(|s| Regex::new(s))
         .transpose()
-        .context("Invalid file_path_regex")?;
+        .with_context(|| format!("Invalid file_path_regex in rule '{}' (section '{}')", rule_config.id, section_name))?;
 
     let file_path_exclude_regex = rule_config
         .file_path_exclude_regex
         .as_ref()
         .map(|s| Regex::new(s))
         .transpose()
-        .context("Invalid file_path_exclude_regex")?;
+        .with_context(|| format!("Invalid file_path_exclude_regex in rule '{}' (section '{}')", rule_config.id, section_name))?;
 
     let command_regex = rule_config
         .command_regex
         .as_ref()
         .map(|s| Regex::new(s))
         .transpose()
-        .context("Invalid command_regex")?;
+        .with_context(|| format!("Invalid command_regex in rule '{}' (section '{}')", rule_config.id, section_name))?;
 
     let command_exclude_regex = rule_config
         .command_exclude_regex
         .as_ref()
         .map(|s| Regex::new(s))
         .transpose()
-        .context("Invalid command_exclude_regex")?;
+        .with_context(|| format!("Invalid command_exclude_regex in rule '{}' (section '{}')", rule_config.id, section_name))?;
 
     let subagent_type_exclude_regex = rule_config
         .subagent_type_exclude_regex
         .as_ref()
         .map(|s| Regex::new(s))
         .transpose()
-        .context("Invalid subagent_type_exclude_regex")?;
+        .with_context(|| format!("Invalid subagent_type_exclude_regex in rule '{}' (section '{}')", rule_config.id, section_name))?;
 
     let prompt_regex = rule_config
         .prompt_regex
         .as_ref()
         .map(|s| Regex::new(s))
         .transpose()
-        .context("Invalid prompt_regex")?;
+        .with_context(|| format!("Invalid prompt_regex in rule '{}' (section '{}')", rule_config.id, section_name))?;
 
     let prompt_exclude_regex = rule_config
         .prompt_exclude_regex
         .as_ref()
         .map(|s| Regex::new(s))
         .transpose()
-        .context("Invalid prompt_exclude_regex")?;
+        .with_context(|| format!("Invalid prompt_exclude_regex in rule '{}' (section '{}')", rule_config.id, section_name))?;
 
     Ok(Rule {
+        id: rule_config.id.clone(),
+        section_name: section_name.to_string(),
+        description: rule_config.description.clone(),
         tool: rule_config.tool.clone(),
         tool_regex,
         tool_exclude_regex,
@@ -374,6 +522,8 @@ mod tests {
     #[test]
     fn test_compile_rule() -> Result<()> {
         let rule_config = RuleConfig {
+            id: "test-read-rule".to_string(),
+            description: Some("Test rule for reading home directory".to_string()),
             tool: Some("Read".to_string()),
             tool_regex: None,
             tool_exclude_regex: None,
@@ -387,7 +537,9 @@ mod tests {
             prompt_exclude_regex: None,
         };
 
-        let rule = compile_rule(&rule_config)?;
+        let rule = compile_rule(&rule_config, "test-section")?;
+        assert_eq!(rule.id, "test-read-rule");
+        assert_eq!(rule.section_name, "test-section");
         assert_eq!(rule.tool, Some("Read".to_string()));
         assert!(rule.file_path_regex.is_some());
         assert!(rule.file_path_exclude_regex.is_some());

@@ -18,8 +18,8 @@ use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::hook_io::{HookInput, HookOutput};
-use crate::logging::{log_tool_use, log_rule_decision};
-use crate::matcher::{Decision, check_rules};
+use crate::logging::{log_decision, create_rule_metadata};
+use crate::matcher::{check_rules, DecisionType};
 
 #[derive(Debug, Parser)]
 #[clap(author, version, about = "Claude Code command permissions hook")]
@@ -46,81 +46,131 @@ enum Commands {
 }
 
 async fn run_hook(config_path: PathBuf, test_mode: bool) -> Result<()> {
-    let config = Config::load_from_file(&config_path).context("Failed to load configuration")?;
-
-    let (deny_rules, allow_rules) = config.compile_rules().context("Failed to compile rules")?;
+    let compiled = Config::load_from_file(&config_path).context("Failed to load configuration")?;
 
     let input = HookInput::read_from_stdin().context("Failed to read hook input")?;
 
-    // Log tool use (non-fatal)
-    log_tool_use(&config.logging.log_file, &input);
-
     // Check deny rules first
-    if let Some(decision) = check_rules(&deny_rules, &input) {
-        let reason = match decision {
-            Decision::Deny(r) | Decision::Allow(r) => r,
-        };
-        let output = HookOutput::deny(reason);
-        log_rule_decision(&config.logging.log_file, &input, "deny", &output);
+    if let Some(decision_info) = check_rules(&compiled.deny_rules, &input) {
+        let output = HookOutput::deny(decision_info.reasoning.clone());
+
+        let rule_metadata = create_rule_metadata(
+            &compiled.deny_rules[decision_info.rule_index],
+            decision_info.rule_index,
+            "deny",
+            &config_path,
+            &decision_info.matched_pattern,
+        );
+
+        log_decision(
+            &compiled.logging.log_file,
+            &compiled.logging.review_log_file,
+            &input,
+            "deny",
+            "rule",
+            &decision_info.reasoning,
+            Some(rule_metadata),
+            None,
+        );
+
         output.write_to_stdout()?;
         return Ok(());
     }
 
     // Check allow rules
-    if let Some(decision) = check_rules(&allow_rules, &input) {
-        match decision {
-            Decision::Allow(reason) => {
-                let output = HookOutput::allow(reason);
-                log_rule_decision(&config.logging.log_file, &input, "allow", &output);
-                output.write_to_stdout()?;
-                return Ok(());
-            }
-            Decision::Deny(reason) => {
-                let output = HookOutput::deny(reason);
-                log_rule_decision(&config.logging.log_file, &input, "allow", &output);
-                output.write_to_stdout()?;
-                return Ok(());
-            }
-        }
+    if let Some(decision_info) = check_rules(&compiled.allow_rules, &input) {
+        let decision_str = match decision_info.decision {
+            DecisionType::Allow => "allow",
+            DecisionType::Deny => "deny",
+        };
+
+        let output = match decision_info.decision {
+            DecisionType::Allow => HookOutput::allow(decision_info.reasoning.clone()),
+            DecisionType::Deny => HookOutput::deny(decision_info.reasoning.clone()),
+        };
+
+        let rule_metadata = create_rule_metadata(
+            &compiled.allow_rules[decision_info.rule_index],
+            decision_info.rule_index,
+            "allow",
+            &config_path,
+            &decision_info.matched_pattern,
+        );
+
+        log_decision(
+            &compiled.logging.log_file,
+            &compiled.logging.review_log_file,
+            &input,
+            decision_str,
+            "rule",
+            &decision_info.reasoning,
+            Some(rule_metadata),
+            None,
+        );
+
+        output.write_to_stdout()?;
+        return Ok(());
     }
 
     // No match - check LLM fallback if enabled
-    if config.llm_fallback.enabled {
-        info!("No rules matched - using LLM fallback for assessment");
-        let result = llm_safety::assess_with_llm(&config.llm_fallback, &input).await;
-        if let Some(output) = llm_safety::apply_llm_result(
-            &config.logging.log_file,
-            &input,
-            result,
-            test_mode,
-        ) {
+    if compiled.llm_fallback.enabled {
+        info!("No rules matched - using LLM fallback");
+        let result = llm_safety::assess_with_llm(&compiled.llm_fallback, &input).await;
+        if let Some((output, llm_metadata)) = llm_safety::apply_llm_result(&input, result, test_mode) {
+            let decision_str = if output.hook_specific_output.permission_decision == "allow" {
+                "allow"
+            } else {
+                "deny"
+            };
+
+            log_decision(
+                &compiled.logging.log_file,
+                &compiled.logging.review_log_file,
+                &input,
+                decision_str,
+                "llm",
+                &output.hook_specific_output.permission_decision_reason,
+                None,
+                Some(llm_metadata),
+            );
+
             output.write_to_stdout()?;
             return Ok(());
         }
     }
 
-    // No match and no LLM decision - exit with no output (normal flow)
+    // No match and no LLM decision - passthrough
+    log_decision(
+        &compiled.logging.log_file,
+        &compiled.logging.review_log_file,
+        &input,
+        "passthrough",
+        "passthrough",
+        "No rule or LLM decision - passed to user",
+        None,
+        None,
+    );
+
     Ok(())
 }
 
 fn validate_config(config_path: PathBuf) -> Result<()> {
-    let config = Config::load_from_file(&config_path).context("Failed to load configuration")?;
-
-    let (deny_rules, allow_rules) = config.compile_rules().context("Failed to compile rules")?;
+    let compiled = Config::load_from_file(&config_path).context("Failed to load configuration")?;
 
     // Validate LLM fallback configuration if enabled
-    config.llm_fallback.validate().context("Invalid LLM fallback configuration")?;
+    compiled.llm_fallback.validate().context("Invalid LLM fallback configuration")?;
 
     info!("Configuration is valid!");
-    info!("  Deny rules: {}", deny_rules.len());
-    info!("  Allow rules: {}", allow_rules.len());
-    info!("  Log file: {}", config.logging.log_file.display());
-    info!("  Log level: {}", config.logging.log_level);
-    if config.llm_fallback.enabled {
+    info!("  Deny rules: {}", compiled.deny_rules.len());
+    info!("  Allow rules: {}", compiled.allow_rules.len());
+    info!("  Operational log: {}", compiled.logging.log_file.display());
+    info!("  Review log: {}", compiled.logging.review_log_file.display());
+    info!("  Log level: {}", compiled.logging.log_level);
+    if compiled.llm_fallback.enabled {
         info!("  LLM fallback: ENABLED");
-        info!("    Endpoint: {}", config.llm_fallback.endpoint.as_ref().unwrap());
-        info!("    Model: {}", config.llm_fallback.model.as_ref().unwrap());
-        info!("    Timeout: {}s", config.llm_fallback.timeout_secs);
+        info!("    Endpoint: {}", compiled.llm_fallback.endpoint.as_ref().unwrap());
+        info!("    Model: {}", compiled.llm_fallback.model.as_ref().unwrap());
+        info!("    Timeout: {}s", compiled.llm_fallback.timeout_secs);
     } else {
         info!("  LLM fallback: disabled");
     }

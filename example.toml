@@ -8,43 +8,6 @@ log_file = "/tmp/claude-tool-use.log"
 # Note: Can be overridden by RUST_LOG environment variable for testing
 log_level = "debug"
 
-# Allow rules - checked after deny rules
-[[allow]]
-tool = "Read"
-file_path_regex = "^/Users/korny/prj/.*"
-file_path_exclude_regex = "\\.\\."
-
-[[allow]]
-tool = "Bash"
-command_regex = "^cargo (build|test|check|clippy|fmt|run)"
-command_exclude_regex = "&|;|\\||`|\\$\\("
-
-[[allow]]
-tool = "Task"
-subagent_type = "codebase-analyzer"
-
-# Allow Context7 MCP tools for documentation lookup (extremely safe, read-only)
-#[[allow]]
-#tool_regex = "^mcp__context7__.*"
-
-# Example: Allow most MCP tools from a server, but exclude specific dangerous ones
-#[[allow]]
-#tool_regex = "^mcp__myserver__.*"
-#tool_exclude_regex = "^mcp__myserver__(delete|destroy|write)_"
-
-# Deny rules - checked first (take precedence)
-[[deny]]
-tool = "Bash"
-command_regex = "^rm .*-rf"
-
-[[deny]]
-tool = "Read"
-file_path_regex = "\\.(env|secret)$"
-
-[[deny]]
-tool = "Read"
-file_path_regex = ".*\\.\\./.*"
-
 # Include shared LLM fallback configuration
 # To enable LLM fallback, edit llm-fallback-config.toml and set enabled = true
 # You can include multiple config files, and they support absolute (/path) or relative (path) references
@@ -52,3 +15,82 @@ file_path_regex = ".*\\.\\./.*"
 files = [
     "llm-fallback-config.toml",
 ]
+
+# Security-critical deny rules - highest priority
+[security]
+description = "Security-critical deny rules to prevent dangerous operations"
+priority = 5
+
+[[security.deny]]
+id = "deny-destructive-rm"
+description = "Block rm commands with -rf flag - high risk of data loss"
+tool = "Bash"
+command_regex = "^rm .*-rf"
+
+[[security.deny]]
+id = "deny-sensitive-files"
+description = "Block reading files with sensitive extensions (.env, .secret)"
+tool = "Read"
+file_path_regex = "\\.(env|secret)$"
+
+[[security.deny]]
+id = "deny-path-traversal"
+description = "Block path traversal attempts using ../ sequences"
+tool = "Read"
+file_path_regex = ".*\\.\\./.*"
+
+# Build tools and package managers
+[build-tools]
+description = "Build and package management tools"
+priority = 10
+
+[[build-tools.allow]]
+id = "allow-safe-cargo"
+description = "Allow safe cargo commands (build/test/check/clippy/fmt/run) without shell injection"
+tool = "Bash"
+command_regex = "^cargo (build|test|check|clippy|fmt|run)"
+command_exclude_regex = "&|;|\\||`|\\$\\("
+
+# File operations
+[file-operations]
+description = "File reading within project directories"
+priority = 20
+
+[[file-operations.allow]]
+id = "allow-read-project-files"
+description = "Allow reading files within project directory, blocking path traversal"
+tool = "Read"
+file_path_regex = "^/Users/korny/prj/.*"
+file_path_exclude_regex = "\\.\\."
+
+# Agent invocation
+[agents]
+description = "Task tool agent invocations"
+priority = 90
+
+[[agents.allow]]
+id = "allow-codebase-analyzer"
+description = "Allow Task tool to invoke codebase-analyzer subagent"
+tool = "Task"
+subagent_type = "codebase-analyzer"
+
+# Example: Allow Context7 MCP tools for documentation lookup (extremely safe, read-only)
+#[mcp-context7]
+#description = "Context7 documentation lookup tools"
+#priority = 85
+#
+#[[mcp-context7.allow]]
+#id = "allow-context7-all"
+#description = "Allow all Context7 MCP tools"
+#tool_regex = "^mcp__context7__.*"
+
+# Example: Allow most MCP tools from a server, but exclude specific dangerous ones
+#[mcp-custom]
+#description = "Custom MCP server tools"
+#priority = 85
+#
+#[[mcp-custom.allow]]
+#id = "allow-mcp-safe"
+#description = "Allow safe MCP tools from custom server"
+#tool_regex = "^mcp__myserver__.*"
+#tool_exclude_regex = "^mcp__myserver__(delete|destroy|write)_"

@@ -1,0 +1,41 @@
+# Logrotate configuration for claude-code-permissions-hook
+#
+# Installation:
+#   sudo cp logrotate.d/claude-code-hook /etc/logrotate.d/claude-code-hook
+#   sudo chown root:root /etc/logrotate.d/claude-code-hook
+#   sudo chmod 644 /etc/logrotate.d/claude-code-hook
+#
+# Test:
+#   sudo logrotate -d /etc/logrotate.d/claude-code-hook  # Dry run
+#   sudo logrotate -f /etc/logrotate.d/claude-code-hook  # Force rotation
+
+/tmp/claude-tool-use.log /tmp/claude-decisions-review.log {
+    # Run rotation as this user/group (required for /tmp)
+    su elivings elivings
+
+    # Rotate when file reaches 10MB
+    size 10M
+
+    # Keep 5 rotated logs (file.log.1 through file.log.5)
+    rotate 5
+
+    # Compress rotated logs with gzip
+    compress
+
+    # Delay compression until next rotation (keeps most recent backup uncompressed)
+    delaycompress
+
+    # Don't error if log file is missing
+    missingok
+
+    # Don't rotate empty files
+    notifempty
+
+    # Copy and truncate the original file instead of moving it
+    # This is important because the hook keeps the file open
+    copytruncate
+
+    # Create new log file with these permissions after rotation
+    # Adjust user/group to match your system
+    create 0664 elivings elivings
+}
